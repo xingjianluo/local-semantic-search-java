@@ -134,4 +134,24 @@ class DocumentStoreTest {
         assertEquals(3, hits.size());
         assertTrue(hits.stream().allMatch(h -> h.scope().equals("team-a")));
     }
+
+    @Test
+    void minScoreFiltersBeforeCountAndIsInclusive() {
+        store.upsert("rel", "语义 检索 语义 检索 引擎", "team-a");
+        store.upsert("irr", "zzz qqq 无关 文本 xyz", "team-a");
+        List<SearchHit> all = store.search("语义 检索 引擎", Set.of("team-a"), 10);
+        double topScore = all.get(0).score();
+        // 取最高分作为门槛：恰好命中边界（含边界），无关文档被排除且不计入 count。
+        List<SearchHit> filtered = store.search("语义 检索 引擎", Set.of("team-a"), 10, topScore);
+        log.info("输入: 相关+无关各一篇，门槛=最高分 {}；过滤前 {} 条，过滤后 {} 条；"
+                + "判定依据: 门槛为 >=（含边界），低于门槛者不出现也不计入计数",
+                topScore, all.size(), filtered.size());
+        assertTrue(all.size() >= 2);
+        assertEquals(1, filtered.size());
+        assertEquals("rel", filtered.get(0).id());
+        assertEquals(topScore, filtered.get(0).score(), 1e-12);
+        // 门槛高于最高分 → 空。
+        assertTrue(store.search("语义 检索 引擎", Set.of("team-a"), 10, Math.nextUp(topScore))
+                .isEmpty());
+    }
 }

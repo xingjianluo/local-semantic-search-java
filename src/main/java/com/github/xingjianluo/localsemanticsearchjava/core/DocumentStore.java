@@ -95,8 +95,19 @@ public class DocumentStore {
 
     /** 查询：对当前快照做相似度检索，不加锁。 */
     public List<SearchHit> search(String query, Set<String> visibleScopes, int topK) {
+        return search(query, visibleScopes, topK, IndexSnapshot.NO_MIN_SCORE);
+    }
+
+    /**
+     * 查询：对当前快照做相似度检索并叠加最低相似度门槛，不加锁。
+     *
+     * <p>得分低于 minScore 的文档不会出现在结果中，也不会计入计数；
+     * 门槛与可见性一起在截断前生效。</p>
+     */
+    public List<SearchHit> search(String query, Set<String> visibleScopes, int topK,
+                                  double minScore) {
         float[] queryVector = embedding.embed(query);
-        return snapshot.search(queryVector, visibleScopes, topK);
+        return snapshot.search(queryVector, visibleScopes, topK, minScore);
     }
 
     public IndexSnapshot currentSnapshot() {

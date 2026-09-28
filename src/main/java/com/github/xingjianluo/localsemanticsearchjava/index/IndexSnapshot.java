@@ -21,6 +21,9 @@ public final class IndexSnapshot {
             Comparator.comparingDouble(SearchHit::score).reversed()
                     .thenComparing(SearchHit::id);
 
+    /** 不启用最低相似度门槛时的占位值。 */
+    public static final double NO_MIN_SCORE = Double.NEGATIVE_INFINITY;
+
     private final Map<String, IndexedDocument> documents;
     private final long version;
 
@@ -61,6 +64,23 @@ public final class IndexSnapshot {
      * @param topK          返回的最大条数
      */
     public List<SearchHit> search(float[] queryVector, Set<String> visibleScopes, int topK) {
+        return search(queryVector, visibleScopes, topK, NO_MIN_SCORE);
+    }
+
+    /**
+     * 在可见范围内做余弦相似度检索，并叠加最低相似度门槛。
+     *
+     * <p>过滤顺序：先按可见性过滤，再打分，随后按最低相似度门槛
+     * （{@code score &gt;= minScore} 才保留）过滤，最后排序与截断。
+     * 低于门槛的文档不会出现在结果中，也不会计入任何计数。</p>
+     *
+     * @param queryVector   查询向量（应为单位向量）
+     * @param visibleScopes 调用方可见范围；文档 scope 属于该集合才可见
+     * @param topK          返回的最大条数
+     * @param minScore      最低相似度（含边界）；{@link #NO_MIN_SCORE} 表示不设门槛
+     */
+    public List<SearchHit> search(float[] queryVector, Set<String> visibleScopes, int topK,
+                                  double minScore) {
         if (topK <= 0 || visibleScopes == null || visibleScopes.isEmpty()) {
             return List.of();
         }
@@ -70,6 +90,9 @@ public final class IndexSnapshot {
                 continue;
             }
             double score = cosine(queryVector, doc.vector());
+            if (score < minScore) {
+                continue;
+            }
             hits.add(new SearchHit(doc.id(), doc.content(), doc.scope(), score));
         }
         hits.sort(HIT_ORDER);
