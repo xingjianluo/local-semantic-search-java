@@ -6,8 +6,9 @@
 
 ```
 api/        SearchController      REST 入口
-core/       DocumentStore         并发读写（copy-on-write 快照）
+core/       DocumentStore         并发读写（copy-on-write 快照）+ 分页遍历
 index/      IndexSnapshot         不可变索引快照 + 相似度检索
+paging/     PageToken/SearchPageResult  无状态翻页游标与分页结果
 embedding/  HashingEmbeddingModel 本地确定性向量化
 rebuild/    RebuildService        索引重建与失败回退
 ```
@@ -59,6 +60,58 @@ rebuild/    RebuildService        索引重建与失败回退
 - 文档可见当且仅当其 `scope ∈ visibleScopes`；空集合返回空结果。
 - 不可见文档不会出现在结果、`count` 或任何返回信息中（过滤先于打分与截断）。
 
+## 分页遍历（scroll）与相关度门槛
+
+`POST /api/search/page` 支持把某个查询下所有符合条件的结果完整翻走（导出、逐页巡检），
+不再受固定 `topK` 上限约束。
+
+**请求**：`{query, visibleScopes[], minScore?, pageSize?, pageToken?}`
+
+- 首页不传 `pageToken`；把上一页响应里的 `nextPageToken` 原样回传取下一页，
+  直到 `nextPageToken` 为 null（`hasMore=false`）即一轮翻完。
+- `pageSize` 默认 50、上限 200；`minScore` 为最低余弦相似度，**边界含等号**
+  （score == minScore 的文档保留），缺省表示不设门槛。
+
+**响应**：`{hits[], count, totalCount, indexVersion, nextPageToken, hasMore, status}`
+
+- `hits`/`count`：本页内容与本页条数；`totalCount`：当前请求的可见范围 + 门槛下的全部命中数
+  （低于门槛与越界的内容既不出现在任何一页，也不计入 `totalCount`），一轮内各页恒定。
+- `status`：`OK` 正常；`STALE`（HTTP 409）表示本轮锚定的索引已变化，结果作废需重开；
+  `INVALID_TOKEN`（HTTP 400）表示令牌损坏或被截断。
+
+**语义约定**
+
+1. **不重不漏、顺序一致**：排序键仍是（得分降序、同分 id 升序），与一次性全量检索完全相同；
+   游标记录上一页最后一条的排序键，跨页拼接顺序与一次性拿到整体逐位一致，几千条量级经过验证。
+2. **顺序跨进程可复现**：游标是无服务端状态的不透明令牌（Base64URL 编码的定长二进制，
+   内含索引版本、查询指纹 SHA-256、上一页排序键与本轮已返回 id 列表）。服务重启后，
+   只要数据与写入序列相同（索引版本一致）、查询相同，旧令牌可继续使用，先后顺序与重启前一致。
+3. **翻页期间的一致性**：首页锚定当时的索引快照版本，续页始终只在该版本的不可变快照上计算。
+   翻页途中若发生写入、删除或索引重建（版本推进），或用与令牌不匹配的查询续翻，
+   服务**不会**在新旧数据之间拼接，而是明确返回 `STALE` 要求丢弃旧令牌从头重开。
+   因此一轮遍历要么整体冻结在开始时的状态，要么整体失败重来——不会重复、不会跳过一整段。
+4. **过滤规则在翻页中叠加生效**：`visibleScopes` 与 `minScore` 随每页请求给出，
+   先过滤后排序计数。可见范围允许在一轮中**收紧**，即使收紧发生在某一页"中途"
+   （首页已返回的内容里排序交错着即将越界的文档）也成立：续页在收紧后的结果上，
+   从游标排序键之后继续扫描，同时跳过令牌里记录的"本轮已返回 id"，
+   因此排序更靠前、此前未返回的仍可见文档会被补回而不是被整段跳过，
+   已返回内容不会重复，越界内容不再出现在任何后续页。
+   放宽范围或改变查询不在语义保证内，需要时应作为新查询从头开一轮。
+5. 门槛可在轮次中调整：提高门槛只会让更多内容被过滤，游标仍按全局排序续取，安全；
+   降低门槛会引入游标之前可能被跳过的条目，应重开一轮。
+
+**与原有行为的兼容范围**
+
+- `/api/search`、`/api/documents`、`DELETE`、`/api/rebuild` 的请求与响应完全不变；
+  分页是叠加能力，不改变既有 topK 检索、幂等写入与重建语义。
+- 排序规则（得分降序、同分 id 升序）、可见性语义（先过滤后打分计数）保持不变，
+  分页逐页拼接结果与对同一查询做一次足够大 topK 的全量检索逐位相同。
+- 索引版本号语义不变：任何真实写/删或成功的重建都会推进版本，分页以此判断一轮是否失效。
+- 令牌只在相同数据与相同查询下有意义；格式带魔数与版本号，截断或损坏返回 400，
+  版本/查询不匹配返回 409。令牌内含已返回 id 列表，体积随一轮总返回量线性增长
+  （实测 3000 条、每 id 9 字符时约 66 KiB，可直接放在请求体中）；
+  一轮翻完或收到 STALE 后令牌即作废，无需长期持有。
+
 ## REST API
 
 | 方法 | 路径                | 说明                                       |
@@ -66,6 +119,7 @@ rebuild/    RebuildService        索引重建与失败回退
 | POST | `/api/documents`    | 写入/更新 `{id?, content, scope}`，幂等    |
 | DELETE | `/api/documents/{id}` | 删除                                     |
 | POST | `/api/search`       | 检索 `{query, visibleScopes[], topK?}`     |
+| POST | `/api/search/page`  | 分页遍历 `{query, visibleScopes[], minScore?, pageSize?, pageToken?}` |
 | POST | `/api/rebuild`      | 重建索引，返回状态与可区分失败原因         |
 
 示例：
@@ -75,6 +129,12 @@ curl -X POST localhost:8080/api/documents -H 'Content-Type: application/json' \
   -d '{"content":"本地语义检索服务","scope":"team-a"}'
 curl -X POST localhost:8080/api/search -H 'Content-Type: application/json' \
   -d '{"query":"语义检索","visibleScopes":["team-a"],"topK":10}'
+
+# 分页遍历：首页不传 pageToken，随后把上一页的 nextPageToken 原样回传
+curl -X POST localhost:8080/api/search/page -H 'Content-Type: application/json' \
+  -d '{"query":"语义检索","visibleScopes":["team-a"],"minScore":0.2,"pageSize":100}'
+curl -X POST localhost:8080/api/search/page -H 'Content-Type: application/json' \
+  -d '{"query":"语义检索","visibleScopes":["team-a"],"minScore":0.2,"pageSize":100,"pageToken":"<nextPageToken>"}'
 ```
 
 ## 本地验证
@@ -90,6 +150,12 @@ mvn spring-boot:run   # 本地启动服务
 - `DocumentStoreTest`：重复写入幂等、更新替换、删除不再召回、越界可见性、排序稳定可复现、topK 先过滤后截断；
 - `ConcurrencyTest`：并发写入与查询下无重复命中、无越界、快照版本单调、命中数落在自洽区间；
 - `RebuildServiceTest`：重建原子生效；校验/向量化/源读取三类注入失败均可区分原因并回退到原索引；重建与并发写并行时终态自洽；
+- `PageTokenTest`：游标编解码往返一致、推进不改变锚点、空白/截断/魔数篡改被拒、查询指纹确定；
+- `PagingTest`：3000 条规模下多种页大小翻页与全量检索逐位一致、不重不漏；跨"重启"（新存储重放相同数据）旧令牌续翻顺序一致；
+  相关度门槛边界含等号、零向量查询、与可见范围叠加；范围在页中途收紧不跳过排序更靠前的范围内文档、不重复不越界；门槛中途提高；
+- `PagingConcurrencyTest`：并发写/删/重建下翻页要么整轮冻结同一版本、拼接数=totalCount，要么明确 STALE 重来；
+  写/删/重建/换查询四种情形确定性触发 STALE；STALE 后重开可完整翻完；
+- `PagingApiTest`：REST 端到端分页拼接、门槛叠加、范围收紧、写入后 409 STALE、坏令牌 400 INVALID_TOKEN；
 - `ApiTest`：REST 端到端（写入→可见性检索→重建→删除）。
 
 所有测试均在日志中打印输入与判定依据（`输入: ...；判定依据: ...`）。

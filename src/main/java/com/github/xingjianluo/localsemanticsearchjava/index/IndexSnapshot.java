@@ -79,6 +79,48 @@ public final class IndexSnapshot {
         return List.copyOf(hits);
     }
 
+    /**
+     * 返回可见范围内、达到最低相似度的全部命中，按
+     * （得分降序、id 升序）排好序，不做条数截断。
+     *
+     * <p>分页遍历与一次性全量检索共用同一份排序，因此逐页拼接的顺序
+     * 与整体结果完全一致。可见性与门槛先于排序、计数生效：越界或低于
+     * 门槛的文档不会出现在结果中，也不计入总数。</p>
+     *
+     * @param queryVector   查询向量（应为单位向量）
+     * @param visibleScopes 调用方可见范围；文档 scope 属于该集合才可见
+     * @param minScore      最低相似度（含边界）；null 表示不设门槛
+     */
+    public List<SearchHit> rankedAll(float[] queryVector, Set<String> visibleScopes, Double minScore) {
+        if (visibleScopes == null || visibleScopes.isEmpty()) {
+            return List.of();
+        }
+        List<SearchHit> hits = new ArrayList<>();
+        for (IndexedDocument doc : documents.values()) {
+            if (!visibleScopes.contains(doc.scope())) {
+                continue;
+            }
+            double score = cosine(queryVector, doc.vector());
+            if (minScore != null && score < minScore) {
+                continue;
+            }
+            hits.add(new SearchHit(doc.id(), doc.content(), doc.scope(), score));
+        }
+        hits.sort(HIT_ORDER);
+        return List.copyOf(hits);
+    }
+
+    /**
+     * 游标定位谓词：命中是否严格排在（afterScore, afterId）之后。
+     * 排序方向为得分降序、同分 id 升序，与 {@link #HIT_ORDER} 一致。
+     */
+    public static boolean strictlyAfter(SearchHit hit, double afterScore, String afterId) {
+        if (hit.score() != afterScore) {
+            return hit.score() < afterScore;
+        }
+        return hit.id().compareTo(afterId) > 0;
+    }
+
     /** 余弦相似度；任一向量为零向量时得分为 0。 */
     public static double cosine(float[] a, float[] b) {
         double dot = 0.0, normA = 0.0, normB = 0.0;
