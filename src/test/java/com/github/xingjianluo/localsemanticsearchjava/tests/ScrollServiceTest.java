@@ -293,4 +293,331 @@ class ScrollServiceTest {
             Thread.currentThread().interrupt();
         }
     }
+
+    // ------------------------------------------------------------------
+    // 缺陷一：同一个翻页请求被超时重发时，必须返回同一页（幂等），
+    // 只有换用响应里的新凭据主动翻页时才推进；不重不漏、末页/空页同理。
+    // ------------------------------------------------------------------
+
+    @Test
+    void repeatedSamePageRequestReturnsSamePageAndDoesNotSkip() {
+        int n = 100;
+        DocumentStore store = newStoreWithDocs(n);
+        ScrollService service = new ScrollService(store, new HashingEmbeddingModel());
+        Set<String> scopes = Set.of("team-a", "team-b");
+        IndexSnapshot snapshot = store.currentSnapshot();
+        List<SearchHit> full = snapshot.search(new HashingEmbeddingModel().embed(QUERY),
+                scopes, Integer.MAX_VALUE);
+
+        ScrollPage p0 = service.startScroll(QUERY, scopes, 20, null);
+        String token1 = p0.nextScrollId();
+        assertNotNull(token1);
+
+        // 同一页凭据连续重发 5 次：逐字段一致，游标绝不前进。
+        ScrollPage p1 = service.next(token1, null);
+        for (int i = 0; i < 5; i++) {
+            ScrollPage replay = service.next(token1, null);
+            assertEquals(p1, replay, "第 " + i + " 次重发必须返回同一页");
+            assertEquals(p1.nextScrollId(), replay.nextScrollId());
+            assertEquals(p1.totalHits(), replay.totalHits());
+            assertEquals(p1.returned(), replay.returned());
+        }
+
+        // 只有主动使用新凭据才推进；每页都再重发一次，拼起来依旧不重不漏。
+        List<SearchHit> collected = new ArrayList<>(p0.hits());
+        collected.addAll(p1.hits());
+        String token = p1.nextScrollId();
+        while (token != null) {
+            ScrollPage page = service.next(token, null);
+            ScrollPage replay = service.next(token, null); // 重放
+            assertEquals(page, replay);
+            collected.addAll(page.hits());
+            token = page.nextScrollId();
+        }
+
+        log.info("输入: {} 篇，页大小 20，每个凭据至少请求两次（含连续 6 次请求第 2 页）；"
+                + "收得 {} 条，整体 {} 条；判定依据: 重发同一凭据永远返回同一页不跳页，"
+                + "主动换新凭据才推进，整轮不重不漏且顺序一致",
+                n, collected.size(), full.size());
+        assertEquals(ids(full), ids(collected));
+        assertEquals(full.size(), new HashSet<>(ids(collected)).size());
+    }
+
+    @Test
+    void lastPageAndEmptyTailPagesAreReplayable() {
+        // 10 篇、页大小 3：3,3,3,1 —— 末页只有 1 条且 nextScrollId 为 null。
+        DocumentStore store = newStoreWithDocs(10);
+        ScrollService service = new ScrollService(store, new HashingEmbeddingModel());
+        Set<String> scopes = Set.of("team-a", "team-b");
+
+        ScrollPage p0 = service.startScroll(QUERY, scopes, 3, null);
+        String lastToken = null;
+        String token = p0.nextScrollId();
+        ScrollPage last = null;
+        while (token != null) {
+            last = service.next(token, null);
+            lastToken = token;
+            token = last.nextScrollId();
+        }
+        assertNotNull(last);
+        assertEquals(1, last.hits().size());
+        assertNull(last.nextScrollId(), "末页凭据必须为 null");
+
+        // 末页凭据可反复重放，内容稳定。
+        for (int i = 0; i < 3; i++) {
+            ScrollPage replay = service.next(lastToken, null);
+            assertEquals(last, replay);
+            assertNull(replay.nextScrollId());
+        }
+
+        // 收紧到空集合：中间页与末页都可能是空页；空页也要能稳定重放，
+        // 直到 nextScrollId 为 null，且 totalHits 随收紧变为 0。
+        ScrollPage q0 = service.startScroll(QUERY, scopes, 3, null);
+        assertEquals(10, q0.totalHits());
+        String t = q0.nextScrollId();
+        ScrollPage page = service.next(t, Set.of()); // 收紧为空
+        assertEquals(0, page.totalHits(), "收紧为空后数量必须立即变为 0");
+        String emptyFinalToken = t;
+        while (page.nextScrollId() != null) {
+            t = page.nextScrollId();
+            page = service.next(t, null); // 粘性：不再声明范围也维持空范围
+            assertEquals(0, page.hits().size(), "收紧为空后不得再带出任何文档");
+            assertEquals(0, page.totalHits());
+            emptyFinalToken = t;
+        }
+        assertNull(page.nextScrollId());
+        ScrollPage emptyReplay = service.next(emptyFinalToken, null);
+        assertEquals(page, emptyReplay, "空末页必须可幂等重放");
+        assertNull(emptyReplay.nextScrollId());
+
+        // 开启时就没有任何命中：首页即末页，空页且无凭据。
+        ScrollPage none = service.startScroll(QUERY, Set.of("team-c"), 3, null);
+        assertTrue(none.hits().isEmpty());
+        assertNull(none.nextScrollId());
+        assertEquals(0, none.totalHits());
+        assertEquals(0, none.returned());
+        log.info("输入: 末页重放、收紧到空范围后的空页链路、零命中开启；判定依据: "
+                + "末页/空页均可稳定重放，空页 totalHits=0，null 凭据标志结束");
+    }
+
+    @Test
+    void jumpAndMalformedTokensAreRejectedRatherThanSilentlySkipping() {
+        DocumentStore store = newStoreWithDocs(50);
+        ScrollService service = new ScrollService(store, new HashingEmbeddingModel());
+        ScrollPage first = service.startScroll(QUERY, Set.of("team-a", "team-b"), 10, null);
+        String token1 = first.nextScrollId();
+
+        // 格式非法。
+        assertThrows(ScrollSessionException.class, () -> service.next("not-a-token", null));
+        assertThrows(ScrollSessionException.class, () -> service.next("uuid:notanint", null));
+
+        // 跳页：第 2 页还没生成就直接要第 5 页 —— 必须明确报错，绝不静默跳段。
+        String sid = token1.substring(0, token1.lastIndexOf(':'));
+        assertThrows(ScrollSessionException.class, () -> service.next(sid + ":4", null));
+
+        // 整轮结束后再拿未来页码来要 —— 明确告知轮次已结束。
+        service.next(token1, null);
+        String t = token1;
+        ScrollPage p = service.next(t, null);
+        while (p.nextScrollId() != null) {
+            p = service.next(p.nextScrollId(), null);
+        }
+        assertThrows(ScrollSessionException.class, () -> service.next(sid + ":99", null));
+        log.info("输入: 非法凭据、跳页凭据、轮次结束后的未来页码；判定依据: 一律明确报错，"
+                + "不静默跳段或重复返回");
+    }
+
+    // ------------------------------------------------------------------
+    // 缺陷二：收紧可见范围后，数量必须与当前生效条件一致，且收紧是粘性的。
+    // ------------------------------------------------------------------
+
+    @Test
+    void tighteningIsStickyAndTotalHitsAlwaysReflectsEffectiveConditions() {
+        int n = 300;
+        DocumentStore store = newStoreWithDocs(n);
+        HashingEmbeddingModel embedding = new HashingEmbeddingModel();
+        Set<String> initial = Set.of("team-a", "team-b");
+        IndexSnapshot snapshot = store.currentSnapshot();
+        float[] qv = embedding.embed(QUERY);
+        List<SearchHit> expectedA = snapshot.search(qv, Set.of("team-a"), Integer.MAX_VALUE);
+
+        ScrollService service = new ScrollService(store, embedding);
+        ScrollPage p0 = service.startScroll(QUERY, initial, 17, null);
+        assertEquals(n, p0.totalHits(), "初始 totalHits 按初始范围计算");
+
+        List<SearchHit> collected = new ArrayList<>();
+        p0.hits().stream().filter(h -> h.scope().equals("team-a")).forEach(collected::add);
+
+        // 第二页收紧为 team-a；此后所有请求都不再声明范围（null），验证粘性。
+        String token = p0.nextScrollId();
+        boolean firstTightened = true;
+        while (token != null) {
+            ScrollPage page = firstTightened
+                    ? service.next(token, Set.of("team-a"))
+                    : service.next(token, null); // 不重新声明，范围也不得回退
+            firstTightened = false;
+            assertEquals(expectedA.size(), page.totalHits(),
+                    "收紧后每一页 totalHits 必须等于当前生效条件下的总数");
+            for (SearchHit h : page.hits()) {
+                assertEquals("team-a", h.scope(), "粘性收紧：越界内容不得复活");
+            }
+            collected.addAll(page.hits());
+            token = page.nextScrollId();
+        }
+
+        log.info("输入: {} 篇（a/b 各半），第二页收紧为 team-a 后不再声明范围；"
+                + "收紧后 totalHits={}，收得 team-a {} 条；判定依据: 收紧粘性、"
+                + "数量始终对应当前范围、越界内容永不复活、team-a 不重不漏",
+                n, expectedA.size(), collected.size());
+        assertEquals(expectedA.size(), collected.size());
+        assertEquals(ids(expectedA), ids(collected));
+        assertEquals(expectedA.size(), new HashSet<>(ids(collected)).size());
+    }
+
+    @Test
+    void totalHitsAfterTighteningAlsoAccountsForFixedThreshold() {
+        int n = 200;
+        DocumentStore store = newStoreWithDocs(n);
+        HashingEmbeddingModel embedding = new HashingEmbeddingModel();
+        IndexSnapshot snapshot = store.currentSnapshot();
+        float[] qv = embedding.embed(QUERY);
+        List<SearchHit> full = snapshot.search(qv, Set.of("team-a", "team-b"),
+                Integer.MAX_VALUE);
+        double threshold = full.get(full.size() / 3).score();
+        List<SearchHit> expectedA = snapshot.search(qv, Set.of("team-a"),
+                Integer.MAX_VALUE, threshold);
+
+        ScrollService service = new ScrollService(store, embedding);
+        ScrollPage p0 = service.startScroll(QUERY, Set.of("team-a", "team-b"), 13, threshold);
+        List<SearchHit> expectedAll = snapshot.search(qv, Set.of("team-a", "team-b"),
+                Integer.MAX_VALUE, threshold);
+        assertEquals(expectedAll.size(), p0.totalHits(), "首页数量按初始范围+门槛");
+
+        String token = p0.nextScrollId();
+        while (token != null) {
+            ScrollPage page = service.next(token, Set.of("team-a"));
+            assertEquals(expectedA.size(), page.totalHits(),
+                    "收紧后数量必须同时反映收紧范围与固定门槛");
+            assertTrue(page.hits().stream().allMatch(h -> h.score() >= threshold));
+            token = page.nextScrollId();
+        }
+        log.info("输入: {} 篇，门槛={}，翻页中收紧为 team-a；收紧后 totalHits={}；"
+                + "判定依据: 数量信息 = 当前可见范围 + 固定门槛下的真实条数",
+                n, threshold, expectedA.size());
+    }
+
+    // ------------------------------------------------------------------
+    // 缺陷三：并发写/删/重建下整轮自洽；重放并发安全。
+    // ------------------------------------------------------------------
+
+    @Test
+    void concurrentRepeatedRequestsStayIdempotentAndRoundStaysPinned() throws Exception {
+        DocumentStore store = newStoreWithDocs(500);
+        HashingEmbeddingModel embedding = new HashingEmbeddingModel();
+        RebuildService rebuild = new RebuildService(store, embedding, new DefaultIndexValidator());
+        ScrollService service = new ScrollService(store, embedding);
+        Set<String> scopes = Set.of("team-a", "team-b");
+
+        IndexSnapshot pinned = store.currentSnapshot();
+        List<SearchHit> expected = pinned.search(embedding.embed(QUERY), scopes,
+                Integer.MAX_VALUE);
+
+        ScrollPage first = service.startScroll(QUERY, scopes, 41, null);
+        List<SearchHit> collected = new ArrayList<>(first.hits());
+        List<Long> versions = new ArrayList<>();
+        versions.add(first.indexVersion());
+
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService mutators = Executors.newFixedThreadPool(2);
+        mutators.submit(() -> {
+            await(start);
+            for (int i = 0; i < 300; i++) {
+                store.upsert("doc-" + (i % 600), "并发改写 brand new rewrite " + i,
+                        i % 2 == 0 ? "team-a" : "team-b");
+                if (i % 5 == 0) {
+                    store.delete("doc-" + ((i + 9) % 500));
+                }
+            }
+        });
+        mutators.submit(() -> {
+            await(start);
+            rebuild.rebuild();
+        });
+        start.countDown();
+
+        // 每一页用 6 个线程并发重放同一凭据：所有响应必须完全相同。
+        ExecutorService readers = Executors.newFixedThreadPool(6);
+        String token = first.nextScrollId();
+        while (token != null) {
+            final String t = token;
+            List<java.util.concurrent.Future<ScrollPage>> futures = new ArrayList<>();
+            for (int i = 0; i < 6; i++) {
+                futures.add(readers.submit(() -> service.next(t, null)));
+            }
+            ScrollPage canonical = null;
+            for (java.util.concurrent.Future<ScrollPage> f : futures) {
+                ScrollPage page = f.get(60, TimeUnit.SECONDS);
+                if (canonical == null) {
+                    canonical = page;
+                } else {
+                    assertEquals(canonical, page, "并发重放同一凭据必须返回同一页");
+                }
+            }
+            collected.addAll(canonical.hits());
+            versions.add(canonical.indexVersion());
+            token = canonical.nextScrollId();
+        }
+        readers.shutdown();
+        mutators.shutdown();
+        assertTrue(mutators.awaitTermination(60, TimeUnit.SECONDS));
+        assertTrue(readers.awaitTermination(60, TimeUnit.SECONDS));
+
+        log.info("输入: 翻页期间并发改写/删除/重建，且每页凭据被 6 线程并发重放；"
+                + "收得 {} 条，期望 {} 条，版本集合={}；判定依据: 重放结果一致，"
+                + "整轮固定在开始快照，不重不漏、版本恒定",
+                collected.size(), expected.size(), new HashSet<>(versions));
+        assertEquals(ids(expected), ids(collected));
+        assertEquals(expected.size(), new HashSet<>(ids(collected)).size());
+        assertEquals(Set.of(pinned.version()), new HashSet<>(versions));
+    }
+
+    // ------------------------------------------------------------------
+    // 中断/重启：凭据不跨进程存活，丢失后必须明确告知重来；重来顺序可复现。
+    // ------------------------------------------------------------------
+
+    @Test
+    void restartLosesTokensButRestartedRoundReproducesSameOrder() {
+        int n = 300;
+        DocumentStore store = newStoreWithDocs(n);
+        HashingEmbeddingModel embedding = new HashingEmbeddingModel();
+        Set<String> scopes = Set.of("team-a", "team-b");
+        ScrollService serviceA = new ScrollService(store, embedding);
+
+        ScrollPage first = serviceA.startScroll(QUERY, scopes, 23, null);
+        List<SearchHit> partial = new ArrayList<>(first.hits());
+        String token = first.nextScrollId();
+        for (int i = 0; i < 3 && token != null; i++) {
+            ScrollPage page = serviceA.next(token, null);
+            partial.addAll(page.hits());
+            token = page.nextScrollId();
+        }
+        String survivingToken = token; // 遍历中途被打断（超时/重启）
+
+        // 模拟服务重启：内存会话与内存数据全部丢失，重新写入相同数据。
+        DocumentStore restartedStore = newStoreWithDocs(n);
+        ScrollService serviceB = new ScrollService(restartedStore, new HashingEmbeddingModel());
+        ScrollSessionException ex = assertThrows(ScrollSessionException.class,
+                () -> serviceB.next(survivingToken, null));
+        log.info("输入: 翻到中途重启后沿用旧凭据；结果: {}；判定依据: 必须明确告知该轮已失效、"
+                + "需要重新开启，绝不静默跳段或重复", ex.getMessage());
+
+        // 用同样数据同样查询重新开始：整轮顺序与重启前一次性整体结果完全一致。
+        List<SearchHit> full = restartedStore.currentSnapshot()
+                .search(new HashingEmbeddingModel().embed(QUERY), scopes, Integer.MAX_VALUE);
+        ScrollPage restarted = serviceB.startScroll(QUERY, scopes, 77, null);
+        List<SearchHit> redone = drain(serviceB, restarted, id -> serviceB.next(id, null));
+        assertEquals(ids(full), ids(redone), "重启后重新开始的顺序必须可复现");
+        assertEquals(full.size(), new HashSet<>(ids(redone)).size());
+        assertTrue(redone.size() > partial.size(), "重新开始必须完整取回，不丢段");
+    }
 }
